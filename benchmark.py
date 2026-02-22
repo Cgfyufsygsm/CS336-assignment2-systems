@@ -77,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=None)
 
     parser.add_argument("--mode", choices=["forward", "forward-backward", "train-step"], default="forward")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measure-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
@@ -218,6 +219,8 @@ def run_benchmark(args: argparse.Namespace) -> tuple[BenchmarkSummary, dict[str,
     hparams = resolve_model_hparams(args)
 
     model = BasicsTransformerLM(**hparams).to(device)
+    if args.compile:
+        model = torch.compile(model)
     model.train()
 
     optimizer = AdamW(model.parameters(), lr=args.lr)
@@ -341,6 +344,7 @@ def main() -> None:
 
     result = {
         "mode": args.mode,
+        "compile": args.compile,
         "device": args.device,
         "model_size": canonical_model_size(args.model_size),
         "hparams": hparams,
