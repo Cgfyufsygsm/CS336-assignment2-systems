@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
-from cs336_systems.ddp import MinimalDDPFlat, NaiveDDP
+from cs336_systems.ddp import DDPOverlapBucketed, DDPOverlapIndividualParameters, MinimalDDPFlat, NaiveDDP
 
 
 MODEL_SPECS: dict[str, dict[str, int]] = {
@@ -29,6 +29,8 @@ MODEL_SPECS: dict[str, dict[str, int]] = {
 DDP_IMPLS = {
     "naive": NaiveDDP,
     "flat": MinimalDDPFlat,
+    "overlap": DDPOverlapIndividualParameters,
+    "bucketed": DDPOverlapBucketed,
 }
 
 
@@ -85,7 +87,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark DDP training and gradient communication overhead for "
-            "naive (per-parameter all-reduce) and flat (single flattened all-reduce) implementations."
+            "naive (per-parameter sync all-reduce), flat (single flattened all-reduce), "
+            "overlap (per-parameter async all-reduce with backward overlap), "
+            "and bucketed overlap implementations."
         )
     )
     parser.add_argument("--model-size", type=str, default="xl", help="small, medium, large, xl, 2.7b")
@@ -107,7 +111,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--master-port", type=int, default=29592)
     parser.add_argument("--json-output", type=str, default=None)
-    parser.add_argument("--ddp-impl", choices=["naive", "flat"], default="naive")
+    parser.add_argument("--ddp-impl", choices=["naive", "flat", "overlap", "bucketed"], default="naive")
+    parser.add_argument("--bucket-size-mb", type=float, default=10.0)
     return parser.parse_args()
 
 
@@ -163,6 +168,9 @@ def run_one_training_step(
     synchronize_if_cuda(device)
     step_start = time.perf_counter()
 
+    if hasattr(ddp_model, "on_train_batch_start"):
+        ddp_model.on_train_batch_start()
+
     optimizer.zero_grad(set_to_none=True)
     logits = ddp_model(input_ids)
     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
@@ -202,7 +210,10 @@ def benchmark_worker(rank: int, args: argparse.Namespace, queue: mp.SimpleQueue)
     hparams = resolve_model_hparams(args)
     model = BasicsTransformerLM(**hparams).to(device)
     model.train()
-    ddp_model = DDP_IMPLS[args.ddp_impl](model)
+    if args.ddp_impl == "bucketed":
+        ddp_model = DDP_IMPLS[args.ddp_impl](model, bucket_size_mb=args.bucket_size_mb)
+    else:
+        ddp_model = DDP_IMPLS[args.ddp_impl](model)
     optimizer = AdamW(ddp_model.parameters(), lr=args.lr)
 
     total_steps = args.warmup_steps + args.measure_steps
@@ -268,6 +279,7 @@ def benchmark_worker(rank: int, args: argparse.Namespace, queue: mp.SimpleQueue)
             "local_batch_size": local_batch_size,
             "warmup_steps": args.warmup_steps,
             "measure_steps": args.measure_steps,
+            "bucket_size_mb": args.bucket_size_mb if args.ddp_impl == "bucketed" else None,
             "summary": {
                 "step_times_s": step_times_s,
                 "communication_times_s": communication_times_s,
