@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
-from cs336_systems.ddp import NaiveDDP
+from cs336_systems.ddp import MinimalDDPFlat, NaiveDDP
 
 
 MODEL_SPECS: dict[str, dict[str, int]] = {
@@ -24,6 +24,11 @@ MODEL_SPECS: dict[str, dict[str, int]] = {
     "large": {"d_model": 1280, "d_ff": 5120, "num_layers": 36, "num_heads": 20},
     "xl": {"d_model": 1600, "d_ff": 6400, "num_layers": 48, "num_heads": 25},
     "2.7b": {"d_model": 2560, "d_ff": 10240, "num_layers": 32, "num_heads": 32},
+}
+
+DDP_IMPLS = {
+    "naive": NaiveDDP,
+    "flat": MinimalDDPFlat,
 }
 
 
@@ -79,8 +84,8 @@ def resolve_model_hparams(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark naive DDP training where each parameter gradient is "
-            "individually all-reduced after backward."
+            "Benchmark DDP training and gradient communication overhead for "
+            "naive (per-parameter all-reduce) and flat (single flattened all-reduce) implementations."
         )
     )
     parser.add_argument("--model-size", type=str, default="xl", help="small, medium, large, xl, 2.7b")
@@ -102,6 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--master-port", type=int, default=29592)
     parser.add_argument("--json-output", type=str, default=None)
+    parser.add_argument("--ddp-impl", choices=["naive", "flat"], default="naive")
     return parser.parse_args()
 
 
@@ -148,7 +154,7 @@ def build_local_batches(
 
 def run_one_training_step(
     *,
-    ddp_model: NaiveDDP,
+    ddp_model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
@@ -196,7 +202,7 @@ def benchmark_worker(rank: int, args: argparse.Namespace, queue: mp.SimpleQueue)
     hparams = resolve_model_hparams(args)
     model = BasicsTransformerLM(**hparams).to(device)
     model.train()
-    ddp_model = NaiveDDP(model)
+    ddp_model = DDP_IMPLS[args.ddp_impl](model)
     optimizer = AdamW(ddp_model.parameters(), lr=args.lr)
 
     total_steps = args.warmup_steps + args.measure_steps
@@ -242,12 +248,19 @@ def benchmark_worker(rank: int, args: argparse.Namespace, queue: mp.SimpleQueue)
     dist.all_gather_object(gathered_comm_times, communication_times_s)
 
     if rank == 0:
-        all_step_times = [value for per_rank in gathered_step_times for value in (per_rank or [])]
-        all_comm_times = [value for per_rank in gathered_comm_times for value in (per_rank or [])]
-        comm_fraction = sum(all_comm_times) / sum(all_step_times)
+        step_times_by_rank = [per_rank for per_rank in gathered_step_times if per_rank is not None]
+        comm_times_by_rank = [per_rank for per_rank in gathered_comm_times if per_rank is not None]
+        if len(step_times_by_rank) != args.world_size or len(comm_times_by_rank) != args.world_size:
+            raise RuntimeError("Failed to gather timing data from all ranks.")
+
+        # End-to-end training throughput is bottlenecked by the slowest rank each step.
+        step_times_s = [max(per_rank[i] for per_rank in step_times_by_rank) for i in range(args.measure_steps)]
+        communication_times_s = [max(per_rank[i] for per_rank in comm_times_by_rank) for i in range(args.measure_steps)]
+        comm_fraction = sum(communication_times_s) / sum(step_times_s)
         local_batch_size = args.batch_size // args.world_size
         result = {
             "backend": args.backend,
+            "ddp_impl": args.ddp_impl,
             "world_size": args.world_size,
             "model_size": canonical_model_size(args.model_size),
             "hparams": hparams,
@@ -256,12 +269,12 @@ def benchmark_worker(rank: int, args: argparse.Namespace, queue: mp.SimpleQueue)
             "warmup_steps": args.warmup_steps,
             "measure_steps": args.measure_steps,
             "summary": {
-                "step_times_s": all_step_times,
-                "communication_times_s": all_comm_times,
-                "step_mean_s": statistics.fmean(all_step_times),
-                "step_std_s": statistics.pstdev(all_step_times) if len(all_step_times) > 1 else 0.0,
-                "communication_mean_s": statistics.fmean(all_comm_times),
-                "communication_std_s": statistics.pstdev(all_comm_times) if len(all_comm_times) > 1 else 0.0,
+                "step_times_s": step_times_s,
+                "communication_times_s": communication_times_s,
+                "step_mean_s": statistics.fmean(step_times_s),
+                "step_std_s": statistics.pstdev(step_times_s) if len(step_times_s) > 1 else 0.0,
+                "communication_mean_s": statistics.fmean(communication_times_s),
+                "communication_std_s": statistics.pstdev(communication_times_s) if len(communication_times_s) > 1 else 0.0,
                 "communication_fraction": comm_fraction,
                 "communication_percent": comm_fraction * 100.0,
             },

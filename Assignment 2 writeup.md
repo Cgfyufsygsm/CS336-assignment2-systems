@@ -317,7 +317,18 @@ Attention 子模块在长序列下加速明显，`seq_len>=4096` 时前后向普
 > 训练配置：由于 5090 报 OOM 了（峰值显存 > 32 GB），所以使用了 `2 * NVIDIA H800 PCIe` 来跑。
 >
 > 其余配置和作业要求保持一致，`context_length=128`，`warmup_steps=5`，`measure_steps=10`，`batch_size=4`，对应的 local batch size 即为 2。
+>
+> 计时口径采用“每个 step 取所有 rank 的最大值（slowest rank）”来代表端到端吞吐时间。
 
-测得平均每步训练时间为 699.0 ms（std 5.8 ms），其中平均梯度通信时间为 340.4 ms（std 3.9 ms），通信时间占总步时的 48.69%。这说明在 naive DDP（逐参数 all-reduce）下，通信开销已接近总训练开销的一半，是主要性能瓶颈之一。
+测得平均每步训练时间为 **695.80 ms**（std **0.95 ms**），其中平均梯度通信时间为 **341.02 ms**（std **0.99 ms**），通信时间占总步时的 **49.01%**。这说明在 naive DDP（逐参数 all-reduce）下，通信开销接近总训练开销的一半，是主要瓶颈之一。
 
 ### `minimal_ddp_flat_benchmarking`
+
+在与 `naive_ddp_benchmarking` 相同配置下（`1 node x 2 GPUs`，XL，`context_length=128`，`batch_size=4`，`warmup=5`，`measure=10`），对 flatten 后单次 all-reduce 的实现进行 benchmark，结果如下：
+
+| DDP Impl | Step Mean (ms) | Step Std (ms) | Comm Mean (ms) | Comm Std (ms) | Comm Percent |
+| :------- | -------------: | ------------: | -------------: | ------------: | -----------: |
+| naive    |         695.80 |          0.95 |         341.02 |          0.99 |       49.01% |
+| flat     |         711.26 |          2.59 |         356.00 |          3.31 |       50.05% |
+
+本次实验中，`flat` 相比 `naive` 并未带来收益，反而 step 时间增加约 **2.22%**，通信时间增加约 **4.39%**。一个可能原因是 flatten/unflatten 的额外打包与拷贝开销抵消了减少通信调用次数带来的收益，在当前 2 卡单机设置下这一现象更明显。
