@@ -1,10 +1,26 @@
 import torch
 
-def _flashattention2_backward_impl(Q, K, V, O, dO, L):
+
+def _causal_tile_mask(
+    q_len: int,
+    k_len: int,
+    device: torch.device,
+    q_start: int = 0,
+    k_start: int = 0,
+) -> torch.Tensor:
+    q_idx = torch.arange(q_start, q_start + q_len, device=device)[:, None]
+    k_idx = torch.arange(k_start, k_start + k_len, device=device)[None, :]
+    return q_idx >= k_idx
+
+
+def _flashattention2_backward_impl(Q, K, V, O, dO, L, is_causal: bool):
     d = Q.shape[-1]
     scale = d ** -0.5
 
     S = torch.matmul(Q, K.transpose(-2, -1)) * scale
+    if is_causal:
+        mask = _causal_tile_mask(Q.shape[-2], K.shape[-2], Q.device)
+        S = S.masked_fill(~mask, -1e6)
     P = torch.exp(S - L.unsqueeze(-1))
     D = (dO * O).sum(dim=-1, keepdim=True)
 
@@ -21,7 +37,6 @@ class FlashAttention2PyTorch(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
-        # ignore causal in part (a)
         Bq, Bk = 32, 32 # >= 16, 16
         *batch, Nq, D = Q.shape
         Nk = K.shape[-2]
@@ -44,6 +59,15 @@ class FlashAttention2PyTorch(torch.autograd.Function):
                 Vj = V[..., k_start:k_end, :]                            # (..., Bk, D)
 
                 Sij = torch.einsum("...id,...jd->...ij", Qi, Kj) * scale # (..., Bq, Bk)
+                if is_causal:
+                    causal_mask = _causal_tile_mask(
+                        q_end - q_start,
+                        k_end - k_start,
+                        Q.device,
+                        q_start=q_start,
+                        k_start=k_start,
+                    )
+                    Sij = Sij.masked_fill(~causal_mask, -1e6)
                 m_new = torch.maximum(mi, Sij.max(dim=-1).values)        # (..., Bq)
                 P_tilde = torch.exp(Sij - m_new.unsqueeze(-1))           # (..., Bq, Bk)
                 alpha = torch.exp(mi - m_new)
@@ -65,5 +89,5 @@ class FlashAttention2PyTorch(torch.autograd.Function):
         if FlashAttention2PyTorch._compiled_backward is None:
             FlashAttention2PyTorch._compiled_backward = torch.compile(_flashattention2_backward_impl)
 
-        dQ, dK, dV = FlashAttention2PyTorch._compiled_backward(Q, K, V, O, dO, L)
+        dQ, dK, dV = FlashAttention2PyTorch._compiled_backward(Q, K, V, O, dO, L, ctx.is_causal)
         return dQ, dK, dV, None
