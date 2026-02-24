@@ -6,7 +6,7 @@ import torch
 
 from cs336_systems.ddp import DDPOverlapBucketed, DDPOverlapIndividualParameters
 from cs336_systems.sharded_optimizer import ShardedOptimizer
-
+from cs336_systems.flashattention2pytorch import FlashAttention2PyTorch
 
 def get_flashattention_autograd_function_pytorch() -> Type:
     """
@@ -18,7 +18,7 @@ def get_flashattention_autograd_function_pytorch() -> Type:
         A class object (not an instance of the class)
     """
     # For example: return MyFlashAttnAutogradFunctionClass
-    raise NotImplementedError
+    return FlashAttention2PyTorch
 
 
 def get_flashattention_autograd_function_triton() -> Type:
