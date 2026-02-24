@@ -14,22 +14,29 @@ def _causal_tile_mask(
 
 
 def _flashattention2_backward_impl(Q, K, V, O, dO, L, is_causal: bool):
-    d = Q.shape[-1]
+    Qf = Q.to(torch.float32)
+    Kf = K.to(torch.float32)
+    Vf = V.to(torch.float32)
+    Of = O.to(torch.float32)
+    dOf = dO.to(torch.float32)
+    Lf = L.to(torch.float32)
+
+    d = Qf.shape[-1]
     scale = d ** -0.5
 
-    S = torch.matmul(Q, K.transpose(-2, -1)) * scale
+    S = torch.matmul(Qf, Kf.transpose(-2, -1)) * scale
     if is_causal:
-        mask = _causal_tile_mask(Q.shape[-2], K.shape[-2], Q.device)
+        mask = _causal_tile_mask(Qf.shape[-2], Kf.shape[-2], Q.device)
         S = S.masked_fill(~mask, -1e6)
-    P = torch.exp(S - L.unsqueeze(-1))
-    D = (dO * O).sum(dim=-1, keepdim=True)
+    P = torch.exp(S - Lf.unsqueeze(-1))
+    D = (dOf * Of).sum(dim=-1, keepdim=True)
 
-    dV = torch.matmul(P.transpose(-2, -1), dO)
-    dP = torch.matmul(dO, V.transpose(-2, -1))
+    dV = torch.matmul(P.transpose(-2, -1), dOf)
+    dP = torch.matmul(dOf, Vf.transpose(-2, -1))
     dS = P * (dP - D)
-    dQ = torch.matmul(dS, K) * scale
-    dK = torch.matmul(dS.transpose(-2, -1), Q) * scale
-    return dQ, dK, dV
+    dQ = torch.matmul(dS, Kf) * scale
+    dK = torch.matmul(dS.transpose(-2, -1), Qf) * scale
+    return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype)
 
 
 class FlashAttention2PyTorch(torch.autograd.Function):
